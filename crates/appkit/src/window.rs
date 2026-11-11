@@ -147,6 +147,8 @@ mod style {
     pub const CLOSABLE: usize = 1 << 1;
     pub const MINIATURIZABLE: usize = 1 << 2;
     pub const RESIZABLE: usize = 1 << 3;
+    /// `NSWindowStyleMaskUtilityWindow`.
+    pub const UTILITY: usize = 1 << 4;
     /// `NSWindowStyleMaskFullScreen`, which AppKit sets and clears itself;
     /// see `style_mask`.
     pub const FULL_SCREEN: usize = 1 << 14;
@@ -162,6 +164,8 @@ mod style {
 mod window_level {
     /// `NSFloatingWindowLevel`: a tool palette, above its document.
     pub const FLOATING: isize = 3;
+    /// `NSModalPanelWindowLevel`, which is where Qt puts a stay-on-top window.
+    pub const MODAL_PANEL: isize = 8;
     /// `NSPopUpMenuWindowLevel`: a menu, a combo box's list, a popover.
     pub const POPUP_MENU: isize = 101;
     /// `NSScreenSaverWindowLevel`, which is where Qt puts a tooltip - above
@@ -222,7 +226,23 @@ fn presentation(window: &Window) -> Presentation {
     match window.level {
         level if level >= window_level::SCREEN_SAVER => Presentation::Tooltip,
         level if level >= window_level::POPUP_MENU => Presentation::Menu,
+        // Qt's frameless stay-on-top tool windows: drag indicators and the like,
+        // which a window manager would otherwise manage, resize and focus.
+        level if level >= window_level::MODAL_PANEL && window.style_mask & style::UTILITY != 0 => {
+            Presentation::Menu
+        }
         _ => Presentation::Toplevel,
+    }
+}
+
+/// Whether ordering this window front can make it the key window. A drag
+/// indicator cannot: nothing would hand key back when it goes, because a window
+/// that never takes focus produces no focus event.
+fn takes_key(window: &Window, want: Presentation) -> bool {
+    match want {
+        Presentation::Toplevel => true,
+        Presentation::Menu => window.level >= window_level::POPUP_MENU,
+        Presentation::Tooltip => false,
     }
 }
 
@@ -2305,7 +2325,7 @@ fn order_front(receiver: Id, make_key: bool) {
         sdl3::video::window_size(sdl),
     );
     set_up_first_responder(receiver);
-    if make_key && want != Presentation::Tooltip {
+    if make_key && takes_key(window_of(receiver), want) {
         KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
         crate::event::announce_key(receiver);
     }
@@ -3946,6 +3966,30 @@ mod fullscreen_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frameless_stay_on_top_tool_window_is_a_popup_that_never_takes_key() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let body = window_of(window);
+
+        body.style_mask = style::UTILITY | style::MINIATURIZABLE;
+        body.level = window_level::MODAL_PANEL;
+        assert_eq!(presentation(body), Presentation::Menu);
+        assert!(!takes_key(body, Presentation::Menu));
+
+        body.level = window_level::FLOATING;
+        assert_eq!(presentation(body), Presentation::Toplevel);
+
+        body.level = window_level::POPUP_MENU;
+        assert_eq!(presentation(body), Presentation::Menu);
+        assert!(takes_key(body, Presentation::Menu));
+
+        body.style_mask = style::TITLED | style::UTILITY;
+        body.level = window_level::MODAL_PANEL;
+        assert_eq!(presentation(body), Presentation::Toplevel);
+    }
 
     /// What a window is, is read off its style mask and its level together -
     /// and is read again at every ordering, because a toolkit reuses one window
